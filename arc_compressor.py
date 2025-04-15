@@ -18,18 +18,18 @@ class ARCCompressor:
 
     # Define the channel dimensions that all the layers use
     n_layers = 6 #4->6
-    share_up_dim = 16
-    share_down_dim = 12  # 8->12
-    decoding_dim = 6  # 4->6
-    softmax_dim = 4  # 2->4
-    cummax_dim = 6  # 4->6
-    shift_dim = 6  # 4->6
-    nonlinear_dim = 24  # 16->24
+    share_up_dim = 20  # 16->20 (适度增加)
+    share_down_dim = 12  # 保持不变
+    decoding_dim = 6   # 保持不变
+    softmax_dim = 4    # 保持不变
+    cummax_dim = 6     # 保持不变
+    shift_dim = 6      # 保持不变
+    nonlinear_dim = 16  # 24->16 (减少以节省内存)
 
     # This function gives the channel dimension of the residual stream depending on
     # which dimensions are present, for every tensor in the multitensor.
     def channel_dim_fn(self, dims):
-        return 24 if dims[2] == 0 else 12  # 16->24, 8->12
+        return 20 if dims[2] == 0 else 10  # 24->20, 12->10 (稍微减少)
 
     def __init__(self, task):
         """
