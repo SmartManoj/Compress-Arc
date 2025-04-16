@@ -2,6 +2,7 @@ import time
 
 import numpy as np
 import torch
+import torch.optim.lr_scheduler as lr_scheduler
 
 import preprocessing
 import arc_compressor
@@ -34,7 +35,7 @@ def mask_select_logprobs(mask, length):
     log_partition = torch.logsumexp(logprobs, dim=0)
     return log_partition, logprobs
 
-def take_step(task, model, optimizer, train_step, train_history_logger):
+def take_step(task, model, optimizer, train_step, train_history_logger, kl_anneal_factor=1.0):
     """
     Runs a forward pass of the model on the ARC-AGI task.
     Args:
@@ -44,6 +45,7 @@ def take_step(task, model, optimizer, train_step, train_history_logger):
         train_step (int): The training iteration number.
         train_history_logger (Logger): A logger object used for logging the forward pass outputs
                 of the model, as well as accuracy and other things.
+        kl_anneal_factor (float): The factor to scale the KL term in the loss by.
     """
 
     optimizer.zero_grad()
@@ -103,7 +105,8 @@ def take_step(task, model, optimizer, train_step, train_history_logger):
             logprob = torch.logsumexp(coefficient*logprobs, dim=(0,1))/coefficient  # Aggregate for all possible grid sizes
             reconstruction_error = reconstruction_error - logprob
 
-    loss = total_KL + 10*reconstruction_error
+    # KL annealing: scale KL term by kl_anneal_factor
+    loss = kl_anneal_factor * total_KL + 10*reconstruction_error
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
@@ -118,6 +121,7 @@ def take_step(task, model, optimizer, train_step, train_history_logger):
                              total_KL,
                              reconstruction_error,
                              loss)
+    return loss
 
 
 if __name__ == "__main__":
@@ -130,12 +134,16 @@ if __name__ == "__main__":
     tasks = preprocessing.preprocess_tasks(split, task_nums)
     models = []
     optimizers = []
+    schedulers = []
     train_history_loggers = []
     for task in tasks:
         model = arc_compressor.ARCCompressor(task)
         models.append(model)
         optimizer = torch.optim.Adam(model.weights_list, lr=0.01, betas=(0.5, 0.9))
         optimizers.append(optimizer)
+        # Add ReduceLROnPlateau scheduler
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=100, verbose=True)
+        schedulers.append(scheduler)
         train_history_logger = solution_selection.Logger(task)
         visualization.plot_problem(train_history_logger)
         train_history_loggers.append(train_history_logger)
@@ -144,10 +152,13 @@ if __name__ == "__main__":
     true_solution_hashes = [task.solution_hash for task in tasks]
 
     # Train the models one by one
-    for i, (task, model, optimizer, train_history_logger) in enumerate(zip(tasks, models, optimizers, train_history_loggers)):
+    for i, (task, model, optimizer, scheduler, train_history_logger) in enumerate(zip(tasks, models, optimizers, schedulers, train_history_loggers)):
         n_iterations = 2000
         for train_step in range(n_iterations):
-            take_step(task, model, optimizer, train_step, train_history_logger)
+            # KL annealing: increase from 0 to 1 over first 1000 steps
+            kl_anneal_factor = min(1.0, train_step / 1000.0)
+            loss = take_step(task, model, optimizer, train_step, train_history_logger, kl_anneal_factor=kl_anneal_factor)
+            scheduler.step(loss)
         visualization.plot_solution(train_history_logger)
         solution_selection.save_predictions(train_history_loggers[:i+1])
         solution_selection.plot_accuracy(true_solution_hashes)

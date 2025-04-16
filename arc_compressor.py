@@ -1,8 +1,11 @@
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import initializers
 import layers
+import multitensor_systems
 
 
 np.random.seed(0)
@@ -11,25 +14,26 @@ torch.set_default_dtype(torch.float32)
 torch.set_default_device('cuda')
 
 
-class ARCCompressor:
+class ARCCompressor(nn.Module):
     """
     The main model class for the VAE Decoder in our solution to ARC.
     """
 
     # Define the channel dimensions that all the layers use
-    n_layers = 6 #4->6
-    share_up_dim = 20  # 16->20 (适度增加)
-    share_down_dim = 12  # 保持不变
-    decoding_dim = 6   # 保持不变
-    softmax_dim = 4    # 保持不变
-    cummax_dim = 6     # 保持不变
-    shift_dim = 6      # 保持不变
-    nonlinear_dim = 16  # 24->16 (减少以节省内存)
+    n_layers = 6
+    share_up_dim = 20
+    share_down_dim = 12
+    decoding_dim = 6
+    softmax_dim = 4
+    cummax_dim = 6
+    shift_dim = 6
+    nonlinear_dim = 16
+    dropout_rate = 0.2  # New: Dropout rate
 
     # This function gives the channel dimension of the residual stream depending on
     # which dimensions are present, for every tensor in the multitensor.
     def channel_dim_fn(self, dims):
-        return 20 if dims[2] == 0 else 10  # 24->20, 12->10 (稍微减少)
+        return 20 if dims[2] == 0 else 10  # 24->20, 12->10 (slightly reduced)
 
     def __init__(self, task):
         """
@@ -40,6 +44,7 @@ class ARCCompressor:
         Args:
             task (preprocessing.Task): The task which the model is to be made for solving.
         """
+        super().__init__()
         self.multitensor_system = task.multitensor_system
 
         # Initialize weights
@@ -50,13 +55,13 @@ class ARCCompressor:
         initializer.symmetrize_xy(self.decode_weights)
         self.target_capacities = initializer.initialize_multizeros([self.decoding_dim])
 
-        self.share_up_weights = []
-        self.share_down_weights = []
-        self.softmax_weights = []
-        self.cummax_weights = []
-        self.shift_weights = []
-        self.direction_share_weights = []
-        self.nonlinear_weights = []
+        self.share_up_weights = nn.ParameterList()
+        self.share_down_weights = nn.ParameterList()
+        self.softmax_weights = nn.ParameterList()
+        self.cummax_weights = nn.ParameterList()
+        self.shift_weights = nn.ParameterList()
+        self.direction_share_weights = []  # Not a ParameterList, as it's a list of lists
+        self.nonlinear_weights = nn.ParameterList()
 
         for layer_num in range(self.n_layers):
             self.share_up_weights.append(initializer.initialize_multiresidual(self.share_up_dim, self.share_up_dim))
@@ -68,10 +73,10 @@ class ARCCompressor:
             self.direction_share_weights.append(initializer.initialize_multidirection_share())
             self.nonlinear_weights.append(initializer.initialize_multiresidual(self.nonlinear_dim, self.nonlinear_dim))
 
-        self.head_weights = initializer.initialize_head()
-        self.mask_weights = initializer.initialize_linear(
+        self.head_weights = nn.ParameterList([nn.Parameter(w) for w in initializer.initialize_head()])
+        self.mask_weights = nn.ParameterList([nn.Parameter(w) for w in initializer.initialize_linear(
             [1, 0, 0, 1, 0], [self.channel_dim_fn([1, 0, 0, 1, 0]), 2]
-        )
+        )])
 
         # Symmetrize weights so that their behavior is equivariant to swapping x and y dimension ordering
         for weight_list in [
@@ -88,10 +93,10 @@ class ARCCompressor:
         for layer_num in range(self.n_layers):
             initializer.symmetrize_direction_sharing(self.direction_share_weights[layer_num])
 
-        self.weights_list = initializer.weights_list
+        # Dropout layer
+        self.dropout = nn.Dropout(self.dropout_rate)
 
-
-    def forward(self):
+    def forward(self, training=True):
         """
         Compute the forward pass of the VAE decoder. Start by using internally stored latents,
         and process from there. Output an [example, color, x, y, channel] tensor for the colors,
@@ -110,6 +115,7 @@ class ARCCompressor:
                     tensor in the layers.decode_latents() step.
             list[str]: A list of tensor names that correspond to each tensor in the aforementioned output.
         """
+        self.train(training)
         # Decoding layer
         x, KL_amounts, KL_names = layers.decode_latents(
             self.target_capacities, self.decode_weights, self.multiposteriors
@@ -137,6 +143,8 @@ class ARCCompressor:
 
             # Nonlinear layer
             x = layers.nonlinear(x, self.nonlinear_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
+            # Dropout after nonlinear layer
+            x = multitensor_dropout(x, p=self.dropout_rate, training=self.training)
 
             # Multitensor communication layer
             x = layers.share_down(x, self.share_down_weights[layer_num])
@@ -156,4 +164,26 @@ class ARCCompressor:
         x_mask, y_mask = layers.postprocess_mask(self.multitensor_system.task, x_mask, y_mask)
 
         return output, x_mask, y_mask, KL_amounts, KL_names
+
+    @property
+    def weights_list(self):
+        # Collect all trainable parameters (torch.Tensor) in the model
+        params = []
+        for p in self.head_weights:
+            if isinstance(p, nn.Parameter):
+                params.append(p)
+            elif isinstance(p, (list, tuple)):
+                params.extend([x for x in p if isinstance(x, nn.Parameter)])
+        for p in self.mask_weights:
+            if isinstance(p, nn.Parameter):
+                params.append(p)
+            elif isinstance(p, (list, tuple)):
+                params.extend([x for x in p if isinstance(x, nn.Parameter)])
+        # Add any other nn.Parameter or nn.ParameterList attributes as needed
+        return params
+
+
+@multitensor_systems.multify
+def multitensor_dropout(dims, x, p=0.2, training=True):
+    return F.dropout(x, p=p, training=training)
 
